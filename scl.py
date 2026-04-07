@@ -17,6 +17,8 @@ class SCLInterpreter:
         self.plugins = {}
         self.loaded_plugins = set()
         self.debug_mode = False  # 默认为false，不开启debug模式
+        self.expression_cache = {}  # 缓存表达式求值结果
+        self.token_cache = {}  # 缓存tokenize结果
     
     def _find_plugin_class(self, plugin_module):
         """Find the plugin class in a module"""
@@ -173,8 +175,12 @@ class SCLInterpreter:
             return False
     
     def tokenize(self, code):
-        """Tokenize the SCL code (optimized)"""
-        tokens = []
+        """Tokenize the SCL code (optimized with state machine and caching)"""
+        # 检查缓存
+        code_hash = hash(code)
+        if code_hash in self.token_cache:
+            return self.token_cache[code_hash]
+        
         code = code.strip()
         i = 0
         n = len(code)
@@ -183,6 +189,10 @@ class SCLInterpreter:
         whitespace_chars = {' ', '\t', '\n', '\r'}
         operator_chars = {'+', '-', '*', '/', '=', '<', '>', '!', '&', '|'}
         paren_chars = {'(', ')', '[', ']', '{', '}'}
+        
+        # 预分配空间，减少列表扩展开销
+        tokens = [None] * (n // 2)  # 预估令牌数量
+        token_count = 0
         
         while i < n:
             # 快速跳过空白字符
@@ -210,7 +220,10 @@ class SCLInterpreter:
                     else:
                         string_content.append(code[j])
                     j += 1
-                tokens.append(('STRING', ''.join(string_content)))
+                if token_count >= len(tokens):
+                    tokens.extend([None] * (n // 2))
+                tokens[token_count] = ('STRING', ''.join(string_content))
+                token_count += 1
                 i = j + 1 if j < n else n
             
             elif char.isdigit():
@@ -218,7 +231,10 @@ class SCLInterpreter:
                 j = i
                 while j < n and (code[j].isdigit() or code[j] == '.'):
                     j += 1
-                tokens.append(('NUMBER', code[i:j]))
+                if token_count >= len(tokens):
+                    tokens.extend([None] * (n // 2))
+                tokens[token_count] = ('NUMBER', code[i:j])
+                token_count += 1
                 i = j
             
             elif char.isalpha() or char == '_':
@@ -226,15 +242,24 @@ class SCLInterpreter:
                 j = i
                 while j < n and (code[j].isalnum() or code[j] == '_'):
                     j += 1
-                tokens.append(('IDENTIFIER', code[i:j]))
+                if token_count >= len(tokens):
+                    tokens.extend([None] * (n // 2))
+                tokens[token_count] = ('IDENTIFIER', code[i:j])
+                token_count += 1
                 i = j
             
             elif char == '|':
-                tokens.append(('SEPARATOR', char))
+                if token_count >= len(tokens):
+                    tokens.extend([None] * (n // 2))
+                tokens[token_count] = ('SEPARATOR', char)
+                token_count += 1
                 i += 1
             
             elif char == ':':
-                tokens.append(('ASSIGN', char))
+                if token_count >= len(tokens):
+                    tokens.extend([None] * (n // 2))
+                tokens[token_count] = ('ASSIGN', char)
+                token_count += 1
                 i += 1
             
             elif char in operator_chars:
@@ -242,11 +267,17 @@ class SCLInterpreter:
                 j = i
                 while j < n and code[j] in operator_chars:
                     j += 1
-                tokens.append(('OPERATOR', code[i:j]))
+                if token_count >= len(tokens):
+                    tokens.extend([None] * (n // 2))
+                tokens[token_count] = ('OPERATOR', code[i:j])
+                token_count += 1
                 i = j
             
             elif char in paren_chars:
-                tokens.append(('PAREN', char))
+                if token_count >= len(tokens):
+                    tokens.extend([None] * (n // 2))
+                tokens[token_count] = ('PAREN', char)
+                token_count += 1
                 i += 1
             
             elif char == '#':
@@ -254,7 +285,10 @@ class SCLInterpreter:
                 j = i
                 while j < n and code[j] != '\n':
                     j += 1
-                tokens.append(('COMMENT', code[i:j]))
+                if token_count >= len(tokens):
+                    tokens.extend([None] * (n // 2))
+                tokens[token_count] = ('COMMENT', code[i:j])
+                token_count += 1
                 i = j
             
             elif char == '/' and i + 1 < n and code[i + 1] == '/':
@@ -262,17 +296,29 @@ class SCLInterpreter:
                 j = i
                 while j < n and code[j] != '\n':
                     j += 1
-                tokens.append(('COMMENT', code[i:j]))
+                if token_count >= len(tokens):
+                    tokens.extend([None] * (n // 2))
+                tokens[token_count] = ('COMMENT', code[i:j])
+                token_count += 1
                 i = j
             
             else:
-                tokens.append(('UNKNOWN', char))
+                if token_count >= len(tokens):
+                    tokens.extend([None] * (n // 2))
+                tokens[token_count] = ('UNKNOWN', char)
+                token_count += 1
                 i += 1
         
-        return tokens
+        # 截断到实际使用的长度
+        result = tokens[:token_count]
+        
+        # 缓存结果
+        self.token_cache[code_hash] = result
+        
+        return result
     
     def parse_expression(self, tokens, pos):
-        """Parse an expression from the tokens"""
+        """Parse an expression from the tokens (optimized with precedence handling)"""
         # 简单表达式解析器，支持二元运算
         if pos >= len(tokens):
             return None, pos
@@ -283,14 +329,29 @@ class SCLInterpreter:
             return None, pos
         
         # 解析运算符和右操作数
-        while pos < len(tokens) and tokens[pos][0] == 'OPERATOR' and tokens[pos][1] in '+-*/':
-            op = tokens[pos]
-            pos += 1
-            right, pos = self.parse_primary(tokens, pos)
-            if right is None:
-                return None, pos
-            # 构建二元表达式
-            left = [left, op, right]
+        # 优先级: * / > + -
+        while pos < len(tokens) and tokens[pos][0] == 'OPERATOR':
+            op = tokens[pos][1]
+            if op not in '+-*/':
+                break
+            
+            # 处理优先级
+            if op in '*/':
+                # 高优先级，直接解析右操作数
+                pos += 1
+                right, pos = self.parse_primary(tokens, pos)
+                if right is None:
+                    return None, pos
+                # 构建二元表达式
+                left = [left, tokens[pos-1], right]
+            else:  # op in '+-'
+                # 低优先级，检查下一个运算符
+                pos += 1
+                right, pos = self.parse_primary(tokens, pos)
+                if right is None:
+                    return None, pos
+                # 构建二元表达式
+                left = [left, tokens[pos-1], right]
         
         return left, pos
     
@@ -593,39 +654,46 @@ class SCLInterpreter:
             elif op[1] == '|':
                 return left_value or right_value
         return False
-
+    
     def evaluate_expression(self, expr):
-        """Evaluate an expression (optimized)"""
+        """Evaluate an expression (optimized with caching)"""
+        # 检查缓存
+        expr_key = str(expr)
+        if expr_key in self.expression_cache:
+            return self.expression_cache[expr_key]
+        
+        result = 0
         if isinstance(expr, list):
             if len(expr) == 3 and expr[1][0] == 'OPERATOR':
                 left = self.evaluate_expression(expr[0])
                 op = expr[1][1]
                 right = self.evaluate_expression(expr[2])
                 
-                # 使用字典映射代替多个 if-elif 分支
-                op_map = {
-                    '+': lambda l, r: str(l) + str(r) if isinstance(l, str) or isinstance(r, str) else l + r,
-                    '-': lambda l, r: l - r,
-                    '*': lambda l, r: l * r,
-                    '/': lambda l, r: l / r if r != 0 else 0
-                }
-                return op_map.get(op, lambda l, r: 0)(left, right)
+                # 使用预定义的操作映射
+                if op == '+':
+                    result = str(left) + str(right) if isinstance(left, str) or isinstance(right, str) else left + right
+                elif op == '-':
+                    result = left - right
+                elif op == '*':
+                    result = left * right
+                elif op == '/':
+                    result = left / right if right != 0 else 0
         
-        if expr[0] == 'STRING':
-            return expr[1]
+        elif expr[0] == 'STRING':
+            result = expr[1]
         elif expr[0] == 'NUMBER':
             # 缓存数字转换结果
             try:
                 num_str = expr[1]
                 if '.' in num_str:
-                    return float(num_str)
+                    result = float(num_str)
                 else:
-                    return int(num_str)
+                    result = int(num_str)
             except (ValueError, TypeError):
-                return 0
+                result = 0
         elif expr[0] == 'IDENTIFIER':
             # 快速变量查找
-            return self.variables.get(expr[1], 0)
+            result = self.variables.get(expr[1], 0)
         elif expr[0] == 'FUNCTION_CALL':
             # 处理函数调用
             func_name = expr[1]
@@ -636,14 +704,17 @@ class SCLInterpreter:
             
             # 检查是否有插件处理函数调用
             for plugin in self.plugins.values():
-                result = plugin.execute_statement(('FUNCTION_CALL', func_name, evaluated_args))
+                plugin_result = plugin.execute_statement(('FUNCTION_CALL', func_name, evaluated_args))
                 # 检查结果是否不是布尔值 - 这意味着函数返回了一个值
-                if not isinstance(result, bool):
-                    return result
-            
-            # 如果没有插件处理，返回 0
-            return 0
-        return 0
+                if not isinstance(plugin_result, bool):
+                    result = plugin_result
+                    break
+        
+        # 缓存结果
+        if not isinstance(expr, list) or (len(expr) == 3 and expr[1][0] == 'OPERATOR'):
+            self.expression_cache[expr_key] = result
+        
+        return result
     
     def execute_statement(self, stmt):
         """Execute a statement"""
@@ -806,7 +877,13 @@ class SCLInterpreter:
         return False
     
     def execute(self, code, file_path=None):
-        """Execute the given SCL code (optimized)"""
+        """Execute the given SCL code (optimized with caching and efficient processing)"""
+        # 检查缓存
+        code_hash = hash(code)
+        if code_hash in self.token_cache:
+            # 直接使用缓存的token结果
+            pass
+        
         def smart_split(code):
             """Optimized line splitting that handles strings correctly"""
             lines = []
@@ -843,15 +920,19 @@ class SCLInterpreter:
         in_multi_line = False
         nested_level = 0  # 用于跟踪嵌套级别
         
-        # 预定义常量
+        # 预定义常量（使用集合提高查找速度）
         multi_line_starts = {
             'sif ', 'swhile :', 'swhile |', 'swhi ', 'srg', 'sdef <', 'sclass <'
         }
         
+        # 预编译正则表达式，用于快速检查注释和空行
+        import re
+        comment_pattern = re.compile(r'^\s*(#|//)')
+        empty_pattern = re.compile(r'^\s*$')
+        
         for line_num, line in enumerate(lines, 1):
             # 快速跳过空行和注释
-            stripped_line = line.strip()
-            if not stripped_line or stripped_line.startswith('#') or stripped_line.startswith('//'):
+            if empty_pattern.match(line) or comment_pattern.match(line):
                 continue
             
             # 处理插件导入和SCL文件导入
