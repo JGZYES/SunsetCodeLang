@@ -12,13 +12,62 @@ import tkinter as tk
 
 class SCLInterpreter:
     def __init__(self):
-        self.variables = {}
-        self.functions = {}
-        self.plugins = {}
-        self.loaded_plugins = set()
+        self.variables = {}  # 变量存储
+        self.functions = {}  # 函数存储
+        self.plugins = {}  # 插件存储
+        self.loaded_plugins = set()  # 已加载插件
         self.debug_mode = False  # 默认为false，不开启debug模式
+        
+        # 缓存管理 - 限制缓存大小
         self.expression_cache = {}  # 缓存表达式求值结果
         self.token_cache = {}  # 缓存tokenize结果
+        self.code_block_cache = {}  # 缓存代码块执行结果
+        self.statement_cache = {}  # 缓存语句解析结果
+        
+        # 缓存大小限制
+        self.MAX_CACHE_SIZE = 1000
+        
+        # 预编译正则表达式
+        import re
+        self.comment_pattern = re.compile(r'^\s*(#|//)')
+        self.empty_pattern = re.compile(r'^\s*$')
+        
+        # 预定义常量
+        self.multi_line_starts = {
+            'sif ', 'swhile :', 'swhile |', 'swhi ', 'srg', 'sdef <', 'sclass <'
+        }
+        
+        # 操作符优先级映射
+        self.operator_precedence = {
+            '*': 3,
+            '/': 3,
+            '+': 2,
+            '-': 2,
+            '>': 1,
+            '<': 1,
+            '==': 1,
+            '!=': 1,
+            '>=': 1,
+            '<=': 1,
+            '&': 0,
+            '|': 0
+        }
+        
+        # 快速操作映射
+        self.operation_map = {
+            '+': lambda a, b: str(a) + str(b) if isinstance(a, str) or isinstance(b, str) else a + b,
+            '-': lambda a, b: a - b,
+            '*': lambda a, b: a * b,
+            '/': lambda a, b: a / b if b != 0 else 0,
+            '>': lambda a, b: a > b,
+            '<': lambda a, b: a < b,
+            '==': lambda a, b: a == b,
+            '!=': lambda a, b: a != b,
+            '>=': lambda a, b: a >= b,
+            '<=': lambda a, b: a <= b,
+            '&': lambda a, b: a and b,
+            '|': lambda a, b: a or b
+        }
     
     def _find_plugin_class(self, plugin_module):
         """Find the plugin class in a module"""
@@ -26,6 +75,13 @@ class SCLInterpreter:
             if name.endswith('Plugin') and name[0].isupper():
                 return name
         return None
+    
+    def _manage_cache(self, cache):
+        """管理缓存大小，防止内存过度使用"""
+        if len(cache) > self.MAX_CACHE_SIZE:
+            # 删除最旧的缓存项
+            for key in list(cache.keys())[:len(cache) - self.MAX_CACHE_SIZE]:
+                del cache[key]
 
     def _register_plugin_instance(self, plugin_name, plugin_instance, is_web=False, url=None):
         """Register a plugin instance"""
@@ -184,6 +240,9 @@ class SCLInterpreter:
         code = code.strip()
         i = 0
         n = len(code)
+        if n == 0:
+            self.token_cache[code_hash] = []
+            return []
         
         # 预定义常量
         whitespace_chars = {' ', '\t', '\n', '\r'}
@@ -191,7 +250,7 @@ class SCLInterpreter:
         paren_chars = {'(', ')', '[', ']', '{', '}'}
         
         # 预分配空间，减少列表扩展开销
-        tokens = [None] * (n // 2)  # 预估令牌数量
+        tokens = []
         token_count = 0
         
         while i < n:
@@ -207,23 +266,18 @@ class SCLInterpreter:
             if char == '"':
                 # 字符串处理
                 j = i + 1
-                string_content = []
-                while j < n and code[j] != '"':
+                # 快速查找字符串结束位置
+                while j < n:
                     if code[j] == '\\' and j + 1 < n:
-                        j += 1
-                        if code[j] == 'n':
-                            string_content.append('\n')
-                        elif code[j] == '\\':
-                            string_content.append('\\')
-                        else:
-                            string_content.append(code[j])
+                        j += 2
+                    elif code[j] == '"':
+                        break
                     else:
-                        string_content.append(code[j])
-                    j += 1
-                if token_count >= len(tokens):
-                    tokens.extend([None] * (n // 2))
-                tokens[token_count] = ('STRING', ''.join(string_content))
-                token_count += 1
+                        j += 1
+                # 处理转义字符
+                string_content = code[i+1:j]
+                string_content = string_content.replace('\\n', '\n').replace('\\\\', '\\')
+                tokens.append(('STRING', string_content))
                 i = j + 1 if j < n else n
             
             elif char.isdigit():
@@ -231,10 +285,7 @@ class SCLInterpreter:
                 j = i
                 while j < n and (code[j].isdigit() or code[j] == '.'):
                     j += 1
-                if token_count >= len(tokens):
-                    tokens.extend([None] * (n // 2))
-                tokens[token_count] = ('NUMBER', code[i:j])
-                token_count += 1
+                tokens.append(('NUMBER', code[i:j]))
                 i = j
             
             elif char.isalpha() or char == '_':
@@ -242,24 +293,15 @@ class SCLInterpreter:
                 j = i
                 while j < n and (code[j].isalnum() or code[j] == '_'):
                     j += 1
-                if token_count >= len(tokens):
-                    tokens.extend([None] * (n // 2))
-                tokens[token_count] = ('IDENTIFIER', code[i:j])
-                token_count += 1
+                tokens.append(('IDENTIFIER', code[i:j]))
                 i = j
             
             elif char == '|':
-                if token_count >= len(tokens):
-                    tokens.extend([None] * (n // 2))
-                tokens[token_count] = ('SEPARATOR', char)
-                token_count += 1
+                tokens.append(('SEPARATOR', char))
                 i += 1
             
             elif char == ':':
-                if token_count >= len(tokens):
-                    tokens.extend([None] * (n // 2))
-                tokens[token_count] = ('ASSIGN', char)
-                token_count += 1
+                tokens.append(('ASSIGN', char))
                 i += 1
             
             elif char in operator_chars:
@@ -267,93 +309,73 @@ class SCLInterpreter:
                 j = i
                 while j < n and code[j] in operator_chars:
                     j += 1
-                if token_count >= len(tokens):
-                    tokens.extend([None] * (n // 2))
-                tokens[token_count] = ('OPERATOR', code[i:j])
-                token_count += 1
+                tokens.append(('OPERATOR', code[i:j]))
                 i = j
             
             elif char in paren_chars:
-                if token_count >= len(tokens):
-                    tokens.extend([None] * (n // 2))
-                tokens[token_count] = ('PAREN', char)
-                token_count += 1
+                tokens.append(('PAREN', char))
                 i += 1
             
-            elif char == '#':
+            elif char == '#' or (char == '/' and i + 1 < n and code[i + 1] == '/'):
                 # 注释处理
                 j = i
                 while j < n and code[j] != '\n':
                     j += 1
-                if token_count >= len(tokens):
-                    tokens.extend([None] * (n // 2))
-                tokens[token_count] = ('COMMENT', code[i:j])
-                token_count += 1
-                i = j
-            
-            elif char == '/' and i + 1 < n and code[i + 1] == '/':
-                # 注释处理
-                j = i
-                while j < n and code[j] != '\n':
-                    j += 1
-                if token_count >= len(tokens):
-                    tokens.extend([None] * (n // 2))
-                tokens[token_count] = ('COMMENT', code[i:j])
-                token_count += 1
                 i = j
             
             else:
-                if token_count >= len(tokens):
-                    tokens.extend([None] * (n // 2))
-                tokens[token_count] = ('UNKNOWN', char)
-                token_count += 1
+                tokens.append(('UNKNOWN', char))
                 i += 1
         
-        # 截断到实际使用的长度
-        result = tokens[:token_count]
-        
         # 缓存结果
-        self.token_cache[code_hash] = result
+        self.token_cache[code_hash] = tokens
+        # 管理缓存大小
+        self._manage_cache(self.token_cache)
         
-        return result
+        return tokens
     
     def parse_expression(self, tokens, pos):
         """Parse an expression from the tokens (optimized with precedence handling)"""
-        # 简单表达式解析器，支持二元运算
+        # 检查缓存
+        cache_key = (tuple(tokens), pos)
+        if cache_key in self.statement_cache:
+            return self.statement_cache[cache_key]
+        
         if pos >= len(tokens):
-            return None, pos
+            result = (None, pos)
+            self.statement_cache[cache_key] = result
+            return result
         
-        # 解析左操作数
-        left, pos = self.parse_primary(tokens, pos)
-        if left is None:
-            return None, pos
-        
-        # 解析运算符和右操作数
-        # 优先级: * / > + -
-        while pos < len(tokens) and tokens[pos][0] == 'OPERATOR':
-            op = tokens[pos][1]
-            if op not in '+-*/':
-                break
+        # 递归下降解析器，支持运算符优先级
+        def parse_level(level, pos):
+            if level == 4:  # 最高优先级：括号和基本表达式
+                return self.parse_primary(tokens, pos)
             
-            # 处理优先级
-            if op in '*/':
-                # 高优先级，直接解析右操作数
+            left, pos = parse_level(level + 1, pos)
+            if left is None:
+                return None, pos
+            
+            while pos < len(tokens) and tokens[pos][0] == 'OPERATOR':
+                op = tokens[pos][1]
+                op_prec = self.operator_precedence.get(op, -1)
+                
+                if op_prec != level:
+                    break
+                
                 pos += 1
-                right, pos = self.parse_primary(tokens, pos)
+                right, pos = parse_level(level + 1, pos)
                 if right is None:
                     return None, pos
+                
                 # 构建二元表达式
                 left = [left, tokens[pos-1], right]
-            else:  # op in '+-'
-                # 低优先级，检查下一个运算符
-                pos += 1
-                right, pos = self.parse_primary(tokens, pos)
-                if right is None:
-                    return None, pos
-                # 构建二元表达式
-                left = [left, tokens[pos-1], right]
+            
+            return left, pos
         
-        return left, pos
+        # 从最低优先级开始解析
+        result = parse_level(0, pos)
+        self.statement_cache[cache_key] = result
+        return result
     
     def parse_primary(self, tokens, pos):
         """Parse a primary expression"""
@@ -665,26 +687,21 @@ class SCLInterpreter:
         result = 0
         if isinstance(expr, list):
             if len(expr) == 3 and expr[1][0] == 'OPERATOR':
+                # 递归评估左右操作数
                 left = self.evaluate_expression(expr[0])
                 op = expr[1][1]
                 right = self.evaluate_expression(expr[2])
                 
-                # 使用预定义的操作映射
-                if op == '+':
-                    result = str(left) + str(right) if isinstance(left, str) or isinstance(right, str) else left + right
-                elif op == '-':
-                    result = left - right
-                elif op == '*':
-                    result = left * right
-                elif op == '/':
-                    result = left / right if right != 0 else 0
+                # 使用快速操作映射
+                if op in self.operation_map:
+                    result = self.operation_map[op](left, right)
         
         elif expr[0] == 'STRING':
             result = expr[1]
         elif expr[0] == 'NUMBER':
-            # 缓存数字转换结果
+            # 快速数字转换
+            num_str = expr[1]
             try:
-                num_str = expr[1]
                 if '.' in num_str:
                     result = float(num_str)
                 else:
@@ -700,19 +717,23 @@ class SCLInterpreter:
             args = expr[2]
             
             # 评估参数
-            evaluated_args = [self.evaluate_expression(arg) for arg in args]
+            evaluated_args = []
+            for arg in args:
+                evaluated_args.append(self.evaluate_expression(arg))
             
-            # 检查是否有插件处理函数调用
+            # 快速插件查找
             for plugin in self.plugins.values():
-                plugin_result = plugin.execute_statement(('FUNCTION_CALL', func_name, evaluated_args))
-                # 检查结果是否不是布尔值 - 这意味着函数返回了一个值
-                if not isinstance(plugin_result, bool):
-                    result = plugin_result
-                    break
+                if hasattr(plugin, 'execute_statement'):
+                    plugin_result = plugin.execute_statement(('FUNCTION_CALL', func_name, evaluated_args))
+                    # 检查结果是否不是布尔值 - 这意味着函数返回了一个值
+                    if not isinstance(plugin_result, bool):
+                        result = plugin_result
+                        break
         
         # 缓存结果
-        if not isinstance(expr, list) or (len(expr) == 3 and expr[1][0] == 'OPERATOR'):
-            self.expression_cache[expr_key] = result
+        self.expression_cache[expr_key] = result
+        # 管理缓存大小
+        self._manage_cache(self.expression_cache)
         
         return result
     
@@ -880,59 +901,49 @@ class SCLInterpreter:
         """Execute the given SCL code (optimized with caching and efficient processing)"""
         # 检查缓存
         code_hash = hash(code)
-        if code_hash in self.token_cache:
-            # 直接使用缓存的token结果
-            pass
+        if code_hash in self.code_block_cache:
+            return self.code_block_cache[code_hash]
         
         def smart_split(code):
             """Optimized line splitting that handles strings correctly"""
+            # 快速处理
+            code_len = len(code)
+            if code_len == 0:
+                return []
+            
+            # 预分配空间
             lines = []
             current_line = []
             in_string = False
             
-            # 预分配空间，减少列表扩展开销
-            code_len = len(code)
-            current_line = [''] * code_len
-            line_pos = 0
-            
             for char in code:
                 if char == '"':
                     in_string = not in_string
-                    current_line[line_pos] = char
-                    line_pos += 1
+                    current_line.append(char)
                 elif char == '\n' and not in_string:
-                    lines.append(''.join(current_line[:line_pos]))
-                    current_line = [''] * code_len
-                    line_pos = 0
+                    lines.append(''.join(current_line))
+                    current_line = []
                 else:
-                    current_line[line_pos] = char
-                    line_pos += 1
+                    current_line.append(char)
             
-            if line_pos > 0:
-                lines.append(''.join(current_line[:line_pos]))
+            if current_line:
+                lines.append(''.join(current_line))
             
             return lines
         
         lines = smart_split(code)
+        if not lines:
+            self.code_block_cache[code_hash] = True
+            return True
         
         # 用于处理多行语句
         multi_line_buffer = []
         in_multi_line = False
         nested_level = 0  # 用于跟踪嵌套级别
         
-        # 预定义常量（使用集合提高查找速度）
-        multi_line_starts = {
-            'sif ', 'swhile :', 'swhile |', 'swhi ', 'srg', 'sdef <', 'sclass <'
-        }
-        
-        # 预编译正则表达式，用于快速检查注释和空行
-        import re
-        comment_pattern = re.compile(r'^\s*(#|//)')
-        empty_pattern = re.compile(r'^\s*$')
-        
         for line_num, line in enumerate(lines, 1):
             # 快速跳过空行和注释
-            if empty_pattern.match(line) or comment_pattern.match(line):
+            if self.empty_pattern.match(line) or self.comment_pattern.match(line):
                 continue
             
             # 处理插件导入和SCL文件导入
@@ -943,19 +954,21 @@ class SCLInterpreter:
                 if import_content.startswith('scl :'):
                     scl_path = import_content[5:].strip()
                     if not self.import_scl_file(scl_path, line_num):
+                        self.code_block_cache[code_hash] = False
                         return False
                 else:
                     # 插件导入
                     if not self.load_plugin(import_content):
                         print(f"Error at line {line_num}: Failed to load plugin {import_content}")
                         print(f"Code: {line}")
+                        self.code_block_cache[code_hash] = False
                         return False
                 continue
             
             try:
                 # 检查是否是多行语句的开始
                 is_multi_line_start = False
-                for prefix in multi_line_starts:
+                for prefix in self.multi_line_starts:
                     if line.startswith(prefix):
                         is_multi_line_start = True
                         break
@@ -965,60 +978,36 @@ class SCLInterpreter:
                     is_multi_line_start = True
                 
                 if is_multi_line_start:
-                    # 打印调试信息
-                    if self.debug_mode:
-                        print(f"Debug: Found multi-line statement start: {line}")
                     multi_line_buffer.append(line)
                     if not in_multi_line:
                         in_multi_line = True
                         nested_level = 1  # 开始一个新的多行语句，嵌套级别为1
-                        # 打印调试信息
-                        if self.debug_mode:
-                            print(f"Debug: Started new multi-line statement, nested_level = {nested_level}")
                     else:
                         nested_level += 1  # 遇到新的嵌套语句，嵌套级别加1
-                        # 打印调试信息
-                        if self.debug_mode:
-                            print(f"Debug: Found nested statement, nested_level = {nested_level}")
                 # 检查是否是多行语句的结束
                 elif line == 'end' and in_multi_line:
-                    # 打印调试信息
-                    if self.debug_mode:
-                        print(f"Debug: Found multi-line statement end: {line}")
                     multi_line_buffer.append(line)
                     nested_level -= 1  # 遇到end，嵌套级别减1
-                    # 打印调试信息
-                    if self.debug_mode:
-                        print(f"Debug: Decreased nested_level to {nested_level}")
                     if nested_level == 0:
                         # 嵌套级别为0，说明是外部语句的结束
                         in_multi_line = False
                         # 处理完整的多行语句
                         multi_line_code = '\n'.join(multi_line_buffer)
                         multi_line_buffer = []
-                        # 打印调试信息
-                        if self.debug_mode:
-                            print(f"Debug: Processing complete multi-line statement:\n{multi_line_code}")
-                        # 这里我们需要特殊处理多行语句
-                        # 简单起见，我们将多行语句作为一个整体进行tokenize和parse
-                        # 注意：这种方法可能不是最优的，但是可以解决当前的问题
+                        # 处理多行语句
                         tokens = self.tokenize(multi_line_code)
-                        # 打印调试信息
-                        if self.debug_mode:
-                            print(f"Debug: Tokens: {tokens}")
                         if tokens:
                             stmt, _ = self.parse_statement(tokens, 0)
-                            # 打印调试信息
-                            if self.debug_mode:
-                                print(f"Debug: Parsed statement: {stmt}")
                             if stmt:
                                 if not self.execute_statement(stmt):
                                     print(f"Error at line {line_num}: Failed to execute statement")
                                     print(f"Code: {multi_line_code}")
+                                    self.code_block_cache[code_hash] = False
                                     return False
                             else:
                                 print(f"Error at line {line_num}: Invalid syntax")
                                 print(f"Code: {multi_line_code}")
+                                self.code_block_cache[code_hash] = False
                                 return False
                 # 处理多行语句的中间部分
                 elif in_multi_line:
@@ -1036,23 +1025,32 @@ class SCLInterpreter:
                             if not self.execute_statement(stmt):
                                 print(f"Error at line {line_num}: Failed to execute statement")
                                 print(f"Code: {line}")
+                                self.code_block_cache[code_hash] = False
                                 return False
                         else:
                             print(f"Error at line {line_num}: Invalid syntax")
                             print(f"Code: {line}")
+                            self.code_block_cache[code_hash] = False
                             return False
             except Exception as e:
                 print(f"Error at line {line_num}: {e}")
                 print(f"Code: {line}")
                 import traceback
                 traceback.print_exc()
+                self.code_block_cache[code_hash] = False
                 return False
         
         # 检查是否有未完成的多行语句
         if in_multi_line:
             print(f"Error at line {line_num}: Unclosed multi-line statement")
             print(f"Code: {''.join(multi_line_buffer)}")
+            self.code_block_cache[code_hash] = False
             return False
+        
+        # 缓存结果
+        self.code_block_cache[code_hash] = True
+        # 管理缓存大小
+        self._manage_cache(self.code_block_cache)
         
         return True
 
