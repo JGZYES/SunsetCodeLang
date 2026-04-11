@@ -9,6 +9,7 @@ import os
 import re
 import importlib.util
 import tkinter as tk
+import datetime
 
 class SCLInterpreter:
     def __init__(self):
@@ -440,9 +441,25 @@ class SCLInterpreter:
                                 plugin_assign_pos = plugin_pos + 1
                                 if plugin_assign_pos < len(tokens) and tokens[plugin_assign_pos][0] == 'ASSIGN' and tokens[plugin_assign_pos][1] == ':':
                                     command_pos = plugin_assign_pos + 1
-                                    if command_pos < len(tokens) and tokens[command_pos][0] == 'IDENTIFIER':
-                                        command_name = tokens[command_pos][1]
-                                        args_pos = command_pos + 1
+                                    if command_pos < len(tokens):
+                                        # 处理 time 插件的特殊情况，允许 command 包含冒号
+                                        if plugin_name == 'time':
+                                            # 收集所有 token 直到遇到参数或结束
+                                            command_tokens = []
+                                            current_pos = command_pos
+                                            while current_pos < len(tokens) and not (tokens[current_pos][0] == 'OPERATOR' and tokens[current_pos][1] == '<'):
+                                                command_tokens.append(tokens[current_pos][1])
+                                                current_pos += 1
+                                            command_name = ' '.join(command_tokens)
+                                            args_pos = current_pos
+                                        else:
+                                            # 普通插件，command 是单一标识符
+                                            if tokens[command_pos][0] == 'IDENTIFIER':
+                                                command_name = tokens[command_pos][1]
+                                                args_pos = command_pos + 1
+                                            else:
+                                                # 不是有效的 command，跳过
+                                                return None, pos
                                         
                                         # Parse command arguments in angle brackets
                                         args_tokens = []
@@ -454,6 +471,9 @@ class SCLInterpreter:
                                             if current_arg_pos < len(tokens) and tokens[current_arg_pos][0] == 'OPERATOR' and tokens[current_arg_pos][1] == '>':
                                                 current_arg_pos += 1
                                                 return ('PLUGIN_ASSIGN', var_name, plugin_name, command_name, args_tokens), current_arg_pos
+                                        else:
+                                            # 没有参数的情况，例如 time : now 或 time : Asia/Shanghai : UTC+8
+                                            return ('PLUGIN_ASSIGN', var_name, plugin_name, command_name, args_tokens), args_pos
         
         if pos < len(tokens):
             token = tokens[pos]
@@ -468,6 +488,23 @@ class SCLInterpreter:
         # 处理end语句
         if pos < len(tokens) and tokens[pos][0] == 'IDENTIFIER' and tokens[pos][1] == 'end':
             return ('END',), pos + 1
+        
+        # 处理print语句
+        if pos < len(tokens) and tokens[pos][0] == 'IDENTIFIER' and tokens[pos][1] == 'print':
+            local_pos = pos + 1
+            if local_pos < len(tokens) and tokens[local_pos][0] == 'ASSIGN' and tokens[local_pos][1] == ':':
+                local_pos += 1
+                expr, new_pos = self.parse_expression(tokens, local_pos)
+                if expr:
+                    return ('PRINT', expr), new_pos
+        
+        # 处理 time : now 直接调用
+        if pos < len(tokens) and tokens[pos][0] == 'IDENTIFIER' and tokens[pos][1] == 'time':
+            local_pos = pos + 1
+            if local_pos < len(tokens) and tokens[local_pos][0] == 'ASSIGN' and tokens[local_pos][1] == ':':
+                now_pos = local_pos + 1
+                if now_pos < len(tokens) and tokens[now_pos][0] == 'IDENTIFIER' and tokens[now_pos][1] == 'now':
+                    return ('TIME_NOW',), now_pos + 1
         
         # 直接处理sif、seif、sel和swhi语句
         if pos < len(tokens) and tokens[pos][0] == 'IDENTIFIER' and tokens[pos][1] == 'sif':
@@ -620,6 +657,16 @@ class SCLInterpreter:
                     expr, new_pos = self.parse_expression(tokens, local_pos)
                     if expr:
                         return ('ASSIGNMENT', token[1], expr), new_pos
+                # 处理 time : now 语法
+                elif local_pos < len(tokens) and tokens[local_pos][0] == 'ASSIGN' and tokens[local_pos][1] == ':':
+                    time_pos = local_pos + 1
+                    if time_pos < len(tokens) and tokens[time_pos][0] == 'IDENTIFIER' and tokens[time_pos][1] == 'time':
+                        time_assign_pos = time_pos + 1
+                        if time_assign_pos < len(tokens) and tokens[time_assign_pos][0] == 'ASSIGN' and tokens[time_assign_pos][1] == ':':
+                            now_pos = time_assign_pos + 1
+                            if now_pos < len(tokens) and tokens[now_pos][0] == 'IDENTIFIER' and tokens[now_pos][1] == 'now':
+                                # 处理赋值: set a | a : time : now
+                                return ('TIME_NOW',), now_pos + 1
         
         # 然后调用siew插件，确保它能处理sif和swhile语句
         if 'siew' in self.plugins:
@@ -737,6 +784,8 @@ class SCLInterpreter:
         
         return result
     
+
+    
     def execute_statement(self, stmt):
         """Execute a statement"""
         # 检查是否是debug语句
@@ -803,12 +852,60 @@ class SCLInterpreter:
                 print(f"Debug: Assigned {value} to variable {var_name}")
             return True
         
+        # 处理 time : now 语句
+        if stmt[0] == 'TIME_NOW':
+            return datetime.datetime.now()
+        
         # 处理插件赋值语句: set var | var : plugin : command<args>
         if stmt[0] == 'PLUGIN_ASSIGN':
             var_name = stmt[1]
             plugin_name = stmt[2]
             command_name = stmt[3]
             args_tokens = stmt[4]
+            
+            # 处理 time : now 语法
+            if plugin_name == 'time' and command_name == 'now':
+                value = datetime.datetime.now()
+                self.variables[var_name] = value
+                if self.debug_mode:
+                    print(f"Debug: Assigned {value} to variable {var_name}")
+                return True
+            # 处理 time : 时区 : UTC+ 语法
+            elif plugin_name == 'time' and ':' in command_name:
+                # 解析时区和偏移量
+                # 移除多余的空格，然后按冒号分割
+                command_name_clean = ' '.join(command_name.split())
+                parts = command_name_clean.split(':')
+                if len(parts) == 2:
+                    timezone = parts[0].strip()
+                    offset_str = parts[1].strip()
+                    # 移除偏移量字符串中的空格
+                    offset_str_no_spaces = offset_str.replace(' ', '')
+                    try:
+                        # 解析偏移量，如 UTC+8
+                        if offset_str_no_spaces.startswith('UTC+'):
+                            offset = int(offset_str_no_spaces[4:])
+                            # 计算带有时区偏移的时间（使用 UTC 时间作为基准）
+                            now = datetime.datetime.utcnow()
+                            value = now + datetime.timedelta(hours=offset)
+                            self.variables[var_name] = value
+                            if self.debug_mode:
+                                print(f"Debug: Assigned {value} (timezone: {timezone}, offset: {offset}) to variable {var_name}")
+                            return True
+                        # 处理 UTC- 格式的偏移量
+                        elif offset_str_no_spaces.startswith('UTC-'):
+                            offset = -int(offset_str_no_spaces[4:])
+                            # 计算带有时区偏移的时间（使用 UTC 时间作为基准）
+                            now = datetime.datetime.utcnow()
+                            value = now + datetime.timedelta(hours=offset)
+                            self.variables[var_name] = value
+                            if self.debug_mode:
+                                print(f"Debug: Assigned {value} (timezone: {timezone}, offset: {offset}) to variable {var_name}")
+                            return True
+                    except Exception as e:
+                        print(f"Error parsing timezone: {e}")
+                # 如果解析失败，返回 False
+                return False
             
             # Check if plugin exists
             if plugin_name not in self.plugins:
